@@ -1,0 +1,1626 @@
+---
+title: "Efficiencies and Contagion"
+author: "Ketika Garg; Cecilia Padilla Iglesias; V. Bleu Knight; Nicolas Restrepo Ochoa"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Required packages 
+library(tidyverse)
+library(tidytext)
+library(textreadr)
+library(igraph)
+library(brainGraph)
+library(VertexSort)
+library(data.table)
+library(parallel)
+library(kableExtra)
+library(patchwork)
+library(beepr)
+theme_set(theme_minimal())
+```
+
+## Introduction 
+
+I want to organize the analyses of efficiencies and contagion a bit. I am going to put everything on the same Markdown, so it's all clear and well documented. 
+I'm going to begin looking at the features of the networks, especially the efficiencies. 
+
+## Efficiency
+
+### Building the dataset 
+
+The first step is to build  a dataframe that contains all information about the networks that each run has produced. I am going to load our functions and unpack our data. 
+
+```{r}
+##### Function - Single Network ##### 
+
+get_full_network <- function(run,turns,N) {
+  # Data for just one run
+  tm_data <- read.delim(run,
+                        header = F, sep = ',')
+  # Let's get board coordinates for the each time step 
+  # Create function to extract a matrix of coordinates for each time-step
+  get_coordinates <- function(x, num_agents) {
+    tm <- tm_data[x,-ncol(tm_data)] %>% as_vector() %>% matrix(nrow = num_agents, ncol = 4, byrow = T)
+    colnames(tm) <- c('forager', 'x_coord', 'y_coord', 'food')
+    return(tm)
+  }
+  # Iterate over all time-steps
+  full_coord_list <- map(c(1:turns), get_coordinates, num_agents=N)
+  # Now I am going to create a function to extract network matrices 
+  get_network_matrix <- function(x) {
+    # extract dataset for the coordinates of one time-step 
+    coord <- full_coord_list[[x]] %>% as.data.frame(.)
+    # Empty placeholder matrix
+    net_mat <- matrix(0, N, N)  
+    for (j in 1:N) {
+      # Coordinates for where agent j is 
+      mcx <- coord$x_coord[j] 
+      mcy <- coord$y_coord[j]
+      # Are there any foragers there 
+      coincide <- which(coord$x_coord==mcx & coord$y_coord==mcy)
+      # If there are record on the network matrix
+      for (i in 1:length(coincide)) {
+        net_mat[j,coincide[[i]]] <- 1
+      }
+    }
+    return(net_mat)
+  }
+  # Let's get all networks 
+  full_matrix_list <- map(c(1:turns), get_network_matrix)
+  # Now let's sum all the ties recorded across all time-steps
+  full_matrix <- Reduce("+", full_matrix_list)
+  # Get rid of the diagonal because it's meaningless 
+  diag(full_matrix) <- 0
+  # Create network
+  network <- graph_from_adjacency_matrix(full_matrix, mode = "undirected", weighted = T)
+  return(network)
+}
+
+##### Function - Multiple Network Stats ##### 
+### Function for local efficiency
+local_eff <- function(g) {
+  if (is_empty(E(g))) {
+    eff <- 0
+  } else {
+    # Turn it into an adjacency matrix 
+    net_mat <- as_adj(g,
+                      attr = 'weight', 
+                      sparse = F)
+    # Get the inverse matrix 
+    mat_inv <- net_mat
+    edges <- which(mat_inv > 0)
+    mat_inv[edges] <- (1 / mat_inv[edges])+1
+    # Populate the diagonal with 0s
+    diag(mat_inv) <- 0
+    
+    # Create the new graph 
+    net_inv <- graph_from_adjacency_matrix(mat_inv, 
+                                           weighted = T, 
+                                           mode = 'undirected')
+    
+    if ('degree' %in% vertex_attr_names(net_inv)) {
+      degs <- V(net_inv)$degree
+    } else {
+      degs <- degree(net_inv)
+    } 
+    
+    eff <- numeric(length(degs))
+    nodes <- which(degs > 1)
+    if (is_empty(eff[nodes])==TRUE) {
+      eff <- rep(0, 100)
+    } else {
+      eff[nodes] <- simplify2array(mclapply(nodes, function(x) {
+        neighbs <- neighbors(net_inv, v=x)
+        g.sub <- induced.subgraph(net_inv, neighbs)
+        Nv <- vcount(g.sub)
+        
+        paths <- shortest.paths(g.sub)
+        paths <- paths[upper.tri(paths)]
+        2 / Nv / (Nv - 1) * sum(1 / paths[paths != 0])
+      }, mc.cores=detectCores())
+      )
+    }
+  }
+  return(eff)
+}
+
+### Function Global Efficiency ###
+inverse_efficiency <- function(g) {
+  
+  if (is_empty(E(g))) {
+    geff <- 0
+  } else {
+    
+    # Turn it into an adjacency matrix 
+    net_mat <- as_adj(g,
+                      attr = 'weight', 
+                      sparse = F)
+    
+    # Get the inverse matrix 
+    mat_inv <- net_mat
+    edges <- which(mat_inv > 0)
+    mat_inv[edges] <- (1 / mat_inv[edges])+1
+    # Populate the diagonal with 0s
+    diag(mat_inv) <- 0
+    
+    # Create the new graph 
+    net_inv <- graph_from_adjacency_matrix(mat_inv, 
+                                           weighted = T, 
+                                           mode = 'undirected')
+    D <- distances(net_inv, 
+                   weights = E(net_inv)$weight)
+    Nv <- nrow(D)
+    Dinv <- 1/D
+    eff <- colSums(Dinv * is.finite(Dinv), na.rm = T)/(Nv - 1)
+    geff <- sum(eff)/length(eff)
+  }
+  return(geff)
+}
+
+multiple_network_stats <- function(begin, run, turns, N) {
+  # Imported run
+  path <- paste0(begin, run, '.txt')
+  tm_data <- read.delim(path,
+                        header = F, sep = ',')
+  # Let's get board coordinates for the each time step 
+  # Create function to extract a matrix of coordinates for each time-step
+  get_coordinates <- function(x, num_agents) {
+    tm <- tm_data[x,-ncol(tm_data)] %>% as_vector() %>% matrix(nrow = num_agents, ncol = 4, byrow = T)
+    colnames(tm) <- c('forager', 'x_coord', 'y_coord', 'food')
+    return(tm)
+  }
+  # Iterate over all time-steps
+  full_coord_list <- map(c(1:turns), get_coordinates, num_agents=N)
+  # Now I am going to create a function to extract network matrices 
+  get_network_matrix <- function(x) {
+    # extract dataset for the coordinates of one time-step 
+    coord <- full_coord_list[[x]] %>% as.data.frame(.)
+    # Empty placeholder matrix
+    net_mat <- matrix(0, N, N)  
+    for (j in 1:N) {
+      # Coordinates for where agent j is 
+      mcx <- coord$x_coord[j] 
+      mcy <- coord$y_coord[j]
+      # Are there any foragers there 
+      coincide <- which(coord$x_coord==mcx & coord$y_coord==mcy)
+      # If there are record on the network matrix
+      for (i in 1:length(coincide)) {
+        net_mat[j,coincide[[i]]] <- 1
+      }
+    }
+    return(net_mat)
+  }
+  # Let's get all networks 
+  full_matrix_list <- map(c(1:turns), get_network_matrix)
+  # Now let's sum all the ties recorded across all time-steps
+  full_matrix <- Reduce("+", full_matrix_list)
+  # Get rid of the diagonal because it's meaningless 
+  diag(full_matrix) <- 0
+  # Create network
+  network <- graph_from_adjacency_matrix(full_matrix, mode = "undirected", weighted = T)
+  # Get desired stats
+  # Density
+  dens <- edge_density(network)
+  # Number of Components 
+  comps <- components(network)
+  # Modularity 
+  wtc <- cluster_walktrap(network)
+  mod <- modularity(network, membership(wtc))
+  # Efficiency 
+  number_nodes <- length(V(network))-length(which(degree(network)==0))
+  global_eff <- inverse_efficiency(network)
+  avg_local_eff <- sum(local_eff(network))/100
+  # Transitivity 
+  avg_trans <- transitivity(network, type = 'average')
+  # Average Edge Weight 
+  d <- get.data.frame(network)
+  
+  if (nrow(d) == 0) {
+    avw <- 0
+  } else {
+    w <- get.data.frame(network) %>% 
+      select(weight) %>% 
+      summarise(avg_weight = mean(weight, na.rm = T))
+    
+    avw <- w$avg_weight
+  }
+  net_data <- c(run=run, 
+                dens=dens, 
+                comps=comps$no,
+                global=global_eff, 
+                local=avg_local_eff, 
+                modularity=mod, 
+                avg_weights=avw, 
+                avg_trans=avg_trans)
+  return(net_data)
+}
+
+#### Analysis ####
+#### 50 Monkeys ####
+#### Radius 1 
+cp_r1_b15 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers50/radius1/",
+                    turns=100,
+                    N=50) %>% 
+  mutate(beta = 1.5, 
+         radius = 1)
+cp_r1_b25 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers50/radius1/",
+                    turns=100,
+                    N=50) %>% 
+  mutate(beta = 2.5, 
+         radius = 1)
+cp_r1_b35 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers50/radius1/",
+                    turns=100,
+                    N=50) %>% 
+  mutate(beta = 3.5, 
+         radius = 1)
+cp_r1_b45 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers50/radius1/",
+                    turns=100,
+                    N=50) %>% 
+  mutate(beta = 4.5, 
+         radius = 1)
+cp_r01_b15 <- map_df(c(0:49), 
+                     multiple_network_stats, 
+                     begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers50/radius0.1/",
+                     turns=100,
+                     N=50) %>% 
+  mutate(beta = 1.5, 
+         radius = 0.1)
+cp_r01_b25 <- map_df(c(0:49), 
+                     multiple_network_stats, 
+                     begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers50/radius0.1/",
+                     turns=100,
+                     N=50) %>% 
+  mutate(beta = 2.5, 
+         radius = 0.1)
+cp_r01_b35 <- map_df(c(0:49), 
+                     multiple_network_stats, 
+                     begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers50/radius0.1/",
+                     turns=100,
+                     N=50) %>% 
+  mutate(beta = 3.5, 
+         radius = 0.1)
+cp_r01_b45 <- map_df(c(0:49), 
+                     multiple_network_stats, 
+                     begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers50/radius0.1/",
+                     turns=100,
+                     N=50) %>% 
+  mutate(beta = 4.5, 
+         radius = 0.1)
+cp_r001_b15 <- map_df(c(0:49), 
+                      multiple_network_stats, 
+                      begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers50/radius0.01/",
+                      turns=100,
+                      N=50) %>% 
+  mutate(beta = 1.5, 
+         radius = 0.01)
+cp_r001_b25 <- map_df(c(0:49), 
+                      multiple_network_stats, 
+                      begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers50/radius0.01/",
+                      turns=100,
+                      N=50) %>% 
+  mutate(beta = 2.5, 
+         radius = 0.01)
+cp_r001_b35 <- map_df(c(0:49), 
+                      multiple_network_stats, 
+                      begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers50/radius0.01/",
+                      turns=100,
+                      N=50) %>% 
+  mutate(beta = 3.5, 
+         radius = 0.01)
+cp_r001_b45 <- map_df(c(0:49), 
+                      multiple_network_stats, 
+                      begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers50/radius0.01/",
+                      turns=100,
+                      N=50) %>% 
+  mutate(beta = 4.5, 
+         radius = 0.01)
+cp_r0_b15 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers50/radius0.001/",
+                    turns=100,
+                    N=50) %>% 
+  mutate(beta = 1.5, 
+         radius = 0.001)
+cp_r0_b25 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers50/radius0.001/",
+                    turns=100,
+                    N=50) %>% 
+  mutate(beta = 2.5, 
+         radius = 0.001)
+cp_r0_b35 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers50/radius0.001/",
+                    turns=100,
+                    N=50) %>% 
+  mutate(beta = 3.5, 
+         radius = 0.001)
+cp_r0_b45 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers50/radius0.001/",
+                    turns=100,
+                    N=50) %>% 
+  mutate(beta = 4.5, 
+         radius = 0.001)
+
+df_50 <- rbind(cp_r0_b15, 
+               cp_r0_b25, 
+               cp_r0_b35, 
+               cp_r0_b45, 
+               cp_r001_b15, 
+               cp_r001_b25, 
+               cp_r001_b35, 
+               cp_r001_b45, 
+               cp_r01_b15, 
+               cp_r01_b25, 
+               cp_r01_b35, 
+               cp_r01_b45, 
+               cp_r1_b15, 
+               cp_r1_b25, 
+               cp_r1_b35, 
+               cp_r1_b45) %>% 
+  mutate(beta = as.factor(beta), 
+         radius = as.factor(radius), 
+         model = "tethered_cp_50")
+#### 100 Monkeys ####
+#### Radius 1 
+cp_r1_b15 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers100/radius1/",
+                    turns=100,
+                    N=100) %>% 
+  mutate(beta = 1.5, 
+         radius = 1)
+cp_r1_b25 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers100/radius1/",
+                    turns=100,
+                    N=100) %>% 
+  mutate(beta = 2.5, 
+         radius = 1)
+cp_r1_b35 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers100/radius1/",
+                    turns=100,
+                    N=100) %>% 
+  mutate(beta = 3.5, 
+         radius = 1)
+cp_r1_b45 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers100/radius1/",
+                    turns=100,
+                    N=100) %>% 
+  mutate(beta = 4.5, 
+         radius = 1)
+cp_r01_b15 <- map_df(c(0:49), 
+                     multiple_network_stats, 
+                     begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers100/radius0.1/",
+                     turns=100,
+                     N=100) %>% 
+  mutate(beta = 1.5, 
+         radius = 0.1)
+cp_r01_b25 <- map_df(c(0:49), 
+                     multiple_network_stats, 
+                     begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers100/radius0.1/",
+                     turns=100,
+                     N=100) %>% 
+  mutate(beta = 2.5, 
+         radius = 0.1)
+cp_r01_b35 <- map_df(c(0:49), 
+                     multiple_network_stats, 
+                     begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers100/radius0.1/",
+                     turns=100,
+                     N=100) %>% 
+  mutate(beta = 3.5, 
+         radius = 0.1)
+cp_r01_b45 <- map_df(c(0:49), 
+                     multiple_network_stats, 
+                     begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers100/radius0.1/",
+                     turns=100,
+                     N=100) %>% 
+  mutate(beta = 4.5, 
+         radius = 0.1)
+cp_r001_b15 <- map_df(c(0:49), 
+                      multiple_network_stats, 
+                      begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers100/radius0.01/",
+                      turns=100,
+                      N=100) %>% 
+  mutate(beta = 1.5, 
+         radius = 0.01)
+cp_r001_b25 <- map_df(c(0:49), 
+                      multiple_network_stats, 
+                      begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers100/radius0.01/",
+                      turns=100,
+                      N=100) %>% 
+  mutate(beta = 2.5, 
+         radius = 0.01)
+cp_r001_b35 <- map_df(c(0:49), 
+                      multiple_network_stats, 
+                      begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers100/radius0.01/",
+                      turns=100,
+                      N=100) %>% 
+  mutate(beta = 3.5, 
+         radius = 0.01)
+cp_r001_b45 <- map_df(c(0:49), 
+                      multiple_network_stats, 
+                      begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers100/radius0.01/",
+                      turns=100,
+                      N=100) %>% 
+  mutate(beta = 4.5, 
+         radius = 0.01)
+cp_r0_b15 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers100/radius0.001/",
+                    turns=100,
+                    N=100) %>% 
+  mutate(beta = 1.5, 
+         radius = 0.001)
+cp_r0_b25 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers100/radius0.001/",
+                    turns=100,
+                    N=100) %>% 
+  mutate(beta = 2.5, 
+         radius = 0.001)
+cp_r0_b35 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers100/radius0.001/",
+                    turns=100,
+                    N=100) %>% 
+  mutate(beta = 3.5, 
+         radius = 0.001)
+cp_r0_b45 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers100/radius0.001/",
+                    turns=100,
+                    N=100) %>% 
+  mutate(beta = 4.5, 
+         radius = 0.001)
+
+df_200 <- rbind(cp_r0_b15, 
+                cp_r0_b25, 
+                cp_r0_b35, 
+                cp_r0_b45, 
+                cp_r001_b15, 
+                cp_r001_b25, 
+                cp_r001_b35, 
+                cp_r001_b45, 
+                cp_r01_b15, 
+                cp_r01_b25, 
+                cp_r01_b35, 
+                cp_r01_b45, 
+                cp_r1_b15, 
+                cp_r1_b25, 
+                cp_r1_b35, 
+                cp_r1_b45) %>% 
+  mutate(beta = as.factor(beta), 
+         radius = as.factor(radius), 
+         model = "tethered_cp_100")
+
+#### Ramos - 50 ####
+rm_b15 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_50foragers_50runs/beta1.5/foragers50/",
+                    turns=100,
+                    N=50) %>% 
+  mutate(beta = 1.5, 
+         radius = NA)
+rm_b25 <- map_df(c(0:49), 
+                 multiple_network_stats, 
+                 begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_50foragers_50runs/beta2.5/foragers50/",
+                 turns=100,
+                 N=50) %>% 
+  mutate(beta = 2.5, 
+         radius = NA)
+rm_b35 <- map_df(c(0:49), 
+                 multiple_network_stats, 
+                 begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_50foragers_50runs/beta3.5/foragers50/",
+                 turns=100,
+                 N=50) %>% 
+  mutate(beta = 3.5, 
+         radius = NA)
+rm_b45 <- map_df(c(0:49), 
+                 multiple_network_stats, 
+                 begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_50foragers_50runs/beta4.5/foragers50/",
+                 turns=100,
+                 N=50) %>% 
+  mutate(beta = 4.5, 
+         radius = NA)
+
+df_rm_50 <- rbind(rm_b15, 
+                rm_b25, 
+                rm_b35, 
+                rm_b45) %>% 
+  mutate(beta = as.factor(beta), 
+         model = "Ramos_50")
+#### Ramos - 100 ####
+rm_b15 <- map_df(c(0:49), 
+                 multiple_network_stats, 
+                 begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_100foragers_50runs/beta1.5/foragers100/",
+                 turns=100,
+                 N=100) %>% 
+  mutate(beta = 1.5, 
+         radius = NA)
+rm_b25 <- map_df(c(0:49), 
+                 multiple_network_stats, 
+                 begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_100foragers_50runs/beta2.5/foragers100/",
+                 turns=100,
+                 N=100) %>% 
+  mutate(beta = 2.5, 
+         radius = NA)
+rm_b35 <- map_df(c(0:49), 
+                 multiple_network_stats, 
+                 begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_100foragers_50runs/beta3.5/foragers100/",
+                 turns=100,
+                 N=100) %>% 
+  mutate(beta = 3.5, 
+         radius = NA)
+rm_b45 <- map_df(c(0:49), 
+                 multiple_network_stats, 
+                 begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_100foragers_50runs/beta4.5/foragers100/",
+                 turns=100,
+                 N=100) %>% 
+  mutate(beta = 4.5, 
+         radius = NA)
+
+df_rm_100 <- rbind(rm_b15, 
+                  rm_b25, 
+                  rm_b35, 
+                  rm_b45) %>% 
+  mutate(beta = as.factor(beta), 
+         model = "Ramos_100")
+```
+
+This takes a while to run. 
+
+Now, I have four different dataframes. I will make sure their columns coincide and then bind them together. 
+
+```{r}
+# Organize all columns in a similar way
+df_50 <- df_50 %>% 
+  select(model, beta, radius, run, everything())
+df_200 <- df_200 %>% 
+  select(model, beta, radius, run, everything())
+df_rm_50 <- df_rm_50 %>%
+  select(model, beta, radius, run, everything())
+df_rm_100 <- df_rm_100 %>%
+  select(model, beta, radius, run, everything())
+
+# Bind them together 
+fifty_runs <- rbind(df_50, 
+                  df_200, 
+                  df_rm_50, 
+                  df_rm_100)
+
+# Add population 
+
+fifty_runs <- fifty_runs %>% 
+  mutate(population = if_else(str_detect(model, "50"), 50, 100)) %>% 
+  mutate(population = as.factor(population))
+
+```
+
+Now, I'll save the csv to keep. 
+
+```{r}
+write.csv(fifty_runs, "~/Documents/InformationTransmission/networks/fifty_runs.csv")
+```
+
+Now, I'll a the results for the 200 population. 
+
+```{r}
+#### 200 Monkeys ####
+##### Beta 1.5 #####
+cp_b15_r1 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/foragers200_1.5/radius1/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 1.5, 
+         radius = 1)
+cp_b15_r01 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/foragers200_1.5/radius0.1/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 1.5, 
+         radius = 0.1)
+cp_b15_r001 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/foragers200_1.5/radius0.01/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 1.5, 
+         radius = 0.01)
+cp_b15_r0001 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/foragers200_1.5/radius0.001/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 1.5, 
+         radius = 0.001)
+##### Beta 2.5 #####
+
+cp_b25_r1 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers200/radius1/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 2.5, 
+         radius = 1)
+cp_b25_r01 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers200/radius0.1/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 2.5, 
+         radius = 0.1)
+cp_b25_r001 <- map_df(c(0:49), 
+                     multiple_network_stats, 
+                     begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers200/radius0.01/",
+                     turns=100,
+                     N=200) %>% 
+  mutate(beta = 2.5, 
+         radius = 0.01)
+cp_b25_r0001 <- map_df(c(0:44), 
+                      multiple_network_stats, 
+                      begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers200/radius0.001/",
+                      turns=100,
+                      N=200) %>% 
+  mutate(beta = 2.5, 
+         radius = 0.001)
+
+
+##### Beta 3.5 #####
+cp_b35_r1 <- map_df(c(0:49), 
+                      multiple_network_stats, 
+                      begin = "/Users/nrestrepo/Downloads/information_transmission/Data/foragers200_3.5/foragers200/radius1/",
+                      turns=100,
+                      N=200) %>% 
+  mutate(beta = 3.5, 
+         radius = 1)
+cp_b35_r01 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/foragers200_3.5/foragers200/radius0.1/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 3.5, 
+         radius = 0.1)
+cp_b35_r001 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/foragers200_3.5/foragers200/radius0.01/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 3.5, 
+         radius = 0.01)
+cp_b35_r0001 <- map_df(c(0:49), 
+                      multiple_network_stats, 
+                      begin = "/Users/nrestrepo/Downloads/information_transmission/Data/foragers200_3.5/foragers200/radius0.001/",
+                      turns=100,
+                      N=200) %>% 
+  mutate(beta = 3.5, 
+         radius = 0.001)
+
+##### Beta 4.5 ####
+
+cp_b45_r1 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/foragers200_4.5/radius1/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 4.5, 
+         radius = 1)
+cp_b45_r01 <- map_df(c(0:25), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/foragers200_4.5/radius0.1/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 4.5, 
+         radius = 0.1)
+cp_b45_r001 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/foragers200_4.5/radius0.01/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 4.5, 
+         radius = 0.01)
+cp_b45_r0001 <- map_df(c(0:46), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/radius0.001/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 4.5, 
+         radius = 0.001)
+
+
+
+
+
+##### Ramos Model #####
+rm_b15 <- map_df(c(0:49), 
+                    multiple_network_stats, 
+                    begin = "/Users/nrestrepo/Downloads/information_transmission/Data/original_model/beta1.5/foragers200/",
+                    turns=100,
+                    N=200) %>% 
+  mutate(beta = 1.5, 
+         radius = NA)
+rm_b25 <- map_df(c(0:49), 
+                 multiple_network_stats, 
+                 begin = "/Users/nrestrepo/Downloads/information_transmission/Data/original_model/beta2.5/foragers200/",
+                 turns=100,
+                 N=200) %>% 
+  mutate(beta = 2.5, 
+         radius = NA)
+rm_b35 <- map_df(c(0:49), 
+                 multiple_network_stats, 
+                 begin = "/Users/nrestrepo/Downloads/information_transmission/Data/original_model/beta3.5/foragers200/",
+                 turns=100,
+                 N=200) %>% 
+  mutate(beta = 3.5, 
+         radius = NA)
+rm_b45 <- map_df(c(0:49), 
+                 multiple_network_stats, 
+                 begin = "/Users/nrestrepo/Downloads/information_transmission/Data/original_model/beta4.5/foragers200/",
+                 turns=100,
+                 N=200) %>% 
+  mutate(beta = 4.5, 
+         radius = NA)
+
+
+
+##### Create dataframe #####
+df_200 <- rbind(cp_b15_r1, 
+                cp_b15_r01, 
+                cp_b15_r001, 
+                cp_b15_r0001, 
+                cp_b25_r1, 
+                cp_b25_r01, 
+                cp_b25_r001,
+                cp_b25_r0001, 
+                cp_b35_r1, 
+                cp_b35_r01, 
+                cp_b35_r001, 
+                cp_b35_r0001, 
+                cp_b45_r1, 
+                cp_b45_r01, 
+                cp_b45_r001, 
+                cp_b45_r0001) %>% 
+  mutate(beta = as.factor(beta), 
+         radius = as.factor(radius), 
+         model = "tethered_cp_200")
+
+df_200 <- df_200 %>% 
+  select(model, beta, radius, run, everything()) %>% 
+  mutate(population = 200)
+
+df_rm_200 <- rbind(rm_b15, 
+                   rm_b25, 
+                   rm_b35, 
+                   rm_b45) %>% 
+  mutate(beta = as.factor(beta), 
+         radius = as.factor(radius), 
+         model = "rm_200")
+
+df_rm_200 <- df_rm_200 %>% 
+  select(model, beta, radius, run, everything()) %>% 
+  mutate(population = 200)
+
+# Bind them together 
+complete <- rbind(fifty_runs, 
+                  df_200, 
+                  df_rm_200)
+
+```
+
+### Efficiency distributions 
+
+Now, I'm going to plot the efficiencies in the way Ketika has been doing. 
+
+```{r}
+complete %>% 
+  mutate(radius = case_when(is.na(radius) ~ "baseline", 
+         radius == 1 ~ "1", 
+         radius == 0.1 ~ "0.1", 
+         radius == 0.01 ~ "0.01", 
+         radius == 0.001 ~ "0.001")) %>% 
+  group_by(model, beta, radius) %>% 
+  arrange(desc(global)) %>% 
+  slice(1) %>% 
+  mutate(beta = as.numeric(levels(beta))[beta]) %>% 
+  ggplot(aes(x = beta, y = global, color = radius)) +
+  geom_point(alpha = 0.4) + 
+  geom_line(alpha = 0.4 ) +
+  facet_wrap(~population) + 
+  theme_minimal() + 
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+
+complete %>% 
+  mutate(radius = case_when(is.na(radius) ~ "baseline", 
+         radius == 1 ~ "1", 
+         radius == 0.1 ~ "0.1", 
+         radius == 0.01 ~ "0.01", 
+         radius == 0.001 ~ "0.001")) %>% 
+  group_by(model, beta, radius) %>% 
+  arrange(desc(local)) %>% 
+  slice(1) %>% 
+  mutate(beta = as.numeric(levels(beta))[beta]) %>% 
+  ggplot(aes(x = beta, y = local, color = radius)) +
+  geom_point(alpha = 0.4) + 
+  geom_line(alpha = 0.4 ) +
+  facet_wrap(~population) + 
+  theme_minimal() + 
+  scale_x_continuous(breaks = c(1.5,2.5,3.5, 4.5)) +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+
+
+```
+These are the patterns we have come to expect and that we have reproduced several times. Now, let's look at the distributions of efficiencies. 
+
+```{r}
+comp_filt <- complete %>% 
+  mutate(radius = case_when(is.na(radius) ~ "point-to-point", 
+                            radius == 1 ~ "1", 
+                            radius == 0.1 ~ "0.1", 
+                            radius == 0.01 ~ "0.01", 
+                            radius == 0.001 ~ "0.001"), 
+         population = as.factor(population)) %>% 
+  filter(beta %in% c(2.5, 3.5))
+
+global <- comp_filt %>% 
+  ggplot(aes(x = global, fill = population)) +
+  geom_histogram(alpha = 0.5) + 
+  facet_grid(radius ~ beta)  + 
+  theme_minimal() + 
+  labs(title="Global Efficiency", 
+       x = "Efficiency", 
+       y = "", 
+       fill = "Population") +
+  theme(legend.position = "top", 
+        strip.text = element_text(size = 5))
+
+local <- comp_filt %>% 
+  ggplot(aes(x = local, fill = population)) +
+  geom_histogram(alpha = 0.5) + 
+  facet_grid(radius ~ beta)  + 
+  theme_minimal() + 
+  labs(title="Local Efficiency", 
+       x = "Efficiency", 
+       y = "", 
+       fill = "Population") + 
+  theme(legend.position = "none", 
+  strip.text = element_text(size = 5))
+
+p <- (global | local)
+p
+```
+
+Again, similar patters to what we have seen already. Notice that the difference between the point-to-point and the other models is much more considerable in global efficiency. 
+
+## The Networks
+
+I am going to take the most efficient networks in each parameter combination. Here, I am going to use the 100 population simulations.
+
+```{r}
+# Write function to get the most globally efficient network 
+get_best_network <- function(begin, 
+                             b, 
+                             r) {
+  if (is.na(r)) {
+    c_filtered <- complete %>% 
+  filter(population == 100 &
+           beta == b & 
+           is.na(radius))
+  } else {
+c_filtered <- complete %>% 
+  filter(population == 100 &
+           beta == b & 
+           radius == r) 
+}
+best <- which.max(c_filtered$global)
+run <- c_filtered[best,"run"][[1]]
+path <- paste0(begin, run, ".txt")
+net <- get_full_network(run = path,
+                           N = 100, 
+                           turns = 100)
+return(net)
+}
+
+#### Radius 1 ####
+cp_15_1 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers100/radius1/", 
+                 b = 1.5, 
+                 r = 1)
+cp_25_1 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers100/radius1/", 
+                 b = 2.5, 
+                 r = 1)
+cp_35_1 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers100/radius1/", 
+                 b = 3.5, 
+                 r = 1)
+cp_45_1 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers100/radius1/", 
+                 b = 4.5, 
+                 r = 1)
+#### Radius 0.1 ####
+cp_15_01 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers100/radius0.1/", 
+                 b = 1.5, 
+                 r = 0.1)
+cp_25_01 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers100/radius0.1/", 
+                 b = 2.5, 
+                 r = 0.1)
+cp_35_01 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers100/radius0.1/", 
+                 b = 3.5, 
+                 r = 0.1)
+cp_45_01 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers100/radius0.1/", 
+                 b = 4.5, 
+                 r = 0.1)
+
+#### Radius 0.01 ####
+cp_15_001 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers100/radius0.01/", 
+                 b = 1.5, 
+                 r = 0.01)
+cp_25_001 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers100/radius0.01/", 
+                 b = 2.5, 
+                 r = 0.01)
+cp_35_001 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers100/radius0.1/", 
+                 b = 3.5, 
+                 r = 0.01)
+cp_45_001 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers100/radius0.01/", 
+                 b = 4.5, 
+                 r = 0.01)
+
+#### Radius 0.001 ####
+#### Radius 0.01 ####
+cp_15_0001 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta1.5/foragers100/radius0.001/", 
+                 b = 1.5, 
+                 r = 0.001)
+cp_25_0001 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta2.5/foragers100/radius0.001/", 
+                 b = 2.5, 
+                 r = 0.001)
+cp_35_0001 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta3.5/foragers100/radius0.001/", 
+                 b = 3.5, 
+                 r = 0.001)
+cp_45_0001 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/beta4.5/foragers100/radius0.001/", 
+                 b = 4.5, 
+                 r = 0.001)
+
+#### Ramos ####
+rm_15 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_100foragers_50runs/beta1.5/foragers100/", 
+                 b = 1.5, 
+                 r = NA)
+rm_25 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_100foragers_50runs/beta2.5/foragers100/", 
+                 b = 2.5, 
+                 r = NA)
+rm_35 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_100foragers_50runs/beta3.5/foragers100/", 
+                 b = 3.5, 
+                 r = NA)
+rm_45 <- get_best_network(begin = "/Users/nrestrepo/Downloads/information_transmission/Data/ramos_100foragerss_50runs/beta4.5/foragers100/", 
+                 b = 4.5, 
+                 r = NA)
+
+
+```
+
+Now, I am going to plot the networks at beta 2.5, which we know are the most populated. 
+
+```{r}
+plot(cp_25_1, 
+     layout = layout.fruchterman.reingold, 
+     vertex.label = "", vertex.size = 4, vertex.color = "white", 
+     edge.width = E(cp_25_1)$weight/20, 
+     main = "CP - Radius 1")
+```
+
+A fairly connected main component! 
+
+```{r}
+plot(cp_25_01, 
+     layout = layout.fruchterman.reingold, 
+     vertex.label = "", vertex.size = 4, vertex.color = "white", 
+     edge.width = E(cp_25_01)$weight/20, 
+     main = "CP - Radius 0.1")
+```
+
+Just four unconnected isolates but a really connected structure otherwise. 
+
+```{r}
+plot(cp_25_001, 
+     layout = layout.fruchterman.reingold, 
+     vertex.label = "", vertex.size = 4, vertex.color = "white", 
+     edge.width = E(cp_25_001)$weight/20, 
+     main = "CP - Radius 0.01")
+```
+
+Very dense subgraphs that are unconnected with each other. 
+
+```{r}
+plot(cp_25_0001, 
+     layout = layout.fruchterman.reingold, 
+     vertex.label = "", vertex.size = 4, vertex.color = "white", 
+     edge.width = E(cp_25_0001)$weight/20, 
+     main = "CP - Radius 0.001")
+```
+An even more stark view of the balkanization we saw in the graph above. 
+
+```{r}
+plot(rm_25, 
+     layout = layout.fruchterman.reingold, 
+     vertex.label = "", vertex.size = 4, vertex.color = "white", 
+     edge.width = E(rm_25)$weight/20, 
+     main = "Ramos - beta 2.5")
+```
+
+This also has one relatively large main component. It is relatively similar to the one we saw for radius 1 in the central place model. Let's compare the efficiencies of these networks. 
+
+```{r}
+complete %>% 
+  mutate(radius = case_when(is.na(radius) ~ "baseline", 
+         radius == 1 ~ "1", 
+         radius == 0.1 ~ "0.1", 
+         radius == 0.01 ~ "0.01", 
+         radius == 0.001 ~ "0.001")) %>% 
+  filter(beta == 2.5 & population == 100) %>% 
+  group_by(model,radius) %>% 
+  arrange(desc(global)) %>% 
+  slice(1) %>% 
+  select(model, radius, run, global) %>% 
+  kable(.)
+```
+
+We see the kind of differences we had evidence in the plots above. 
+
+Now, I am going to run the contagions simulations.
+
+## Contagion
+
+### Simple 
+
+```{r}
+
+#### Contagion function with weights 
+
+info_contagion <- function(net, rewire, e = 1, r_max, sim = 1){
+
+  # Rewire network if random is set to TRUE
+  if(rewire){
+    net <- rewire(graph = net, with = keeping_degseq(loops = F, niter = 10^3))
+  }
+  
+  # Get adjacency matrix from network
+  adjm <- get.adjacency(net, sparse = F, attr = "weight")
+  
+  # Turn adjacency matrix into boolean (TRUE / FALSE) - if you dont want weights
+  # adjm_bool <- adjm > 0
+  
+  # Set number of individuals based adjacency matrix
+  N <- vcount(net)
+  
+  # Create a vector indicating possession of info and set one entry to TRUE
+  info <- rep(FALSE, N)
+  info[sample(x = N, size = 1)] <- TRUE
+  
+  # Create a reporting variable
+  proportion <- rep(0, r_max)
+  
+  # Rounds
+  for(r in 1:r_max){
+    # In random sequence go through all individuals without info
+    for(i in sample(N)){
+      # Select i's neighbourhood 
+      nei <- adjm[i,] > 0
+      # If you dont want to include weights, quote above, unquote below
+      #nei <- adjm_bool[i,]
+      # Proceed if there is at least one neighbour
+      if(sum(nei) > 0){
+        # Simple contagion for e = 1 and complex contagion for e = 2
+        if(runif(n = 1, min = 0, max = 1) <= (sum(adjm[i,][info]) / sum(adjm[i,]))^e){
+          info[i] <- TRUE
+        }
+      }
+    }
+    # Record proportion of the population with info
+    proportion[r] <- sum(info) / N
+    # Increment the round counter
+    r <- r + 1
+  }
+  # Return a tibble with simulation results
+  return(tibble(time = 1:r_max, 
+                proportion = proportion, 
+                time_to_max = which(proportion == max(proportion))[1],
+                e = e, 
+                network = ifelse(test = rewire, yes = "random", no = "model output"),
+                sim = sim))
+}
+
+```
+
+Let's start looking at simple contagion which should require fewer turns to reach convergence. I am only going to look at beta 2.5 and 3.5. 
+
+```{r}
+set.seed(3)
+#### Radius 1 ####
+# Simulate beta 2.5 simple
+simple_cp_b25_1 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_25_1, 
+                        rewire = F, 
+                        r_max = 5000, e = 1)
+# Summarize the results a bit 
+summary_cp_b25_1 <- simple_cp_b25_1 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "simple", 
+         beta = "2.5")
+
+# Simulate beta 3.5 simple
+simple_cp_b35_1 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_35_1, 
+                        rewire = F, 
+                        r_max = 5000, e = 1)
+# Summarize the results a bit 
+summary_cp_b35_1 <- simple_cp_b35_1 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "simple", 
+         beta = "3.5")
+
+
+#### Radius 0.1 ####
+# Simulate beta 2.5 simple
+simple_cp_b25_01 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_25_01, 
+                        rewire = F, 
+                        r_max = 5000, e = 1)
+# Summarize the results a bit 
+summary_cp_b25_01 <- simple_cp_b25_01 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "simple", 
+         beta = "2.5")
+
+# Simulate beta 3.5 simple
+simple_cp_b35_01 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_35_01, 
+                        rewire = F, 
+                        r_max = 5000, e = 1)
+# Summarize the results a bit 
+summary_cp_b35_01 <- simple_cp_b35_01 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "simple", 
+         beta = "3.5")
+
+#### Radius 0.01 #### 
+# Simulate beta 2.5 simple
+simple_cp_b25_001 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_25_001, 
+                        rewire = F, 
+                        r_max = 5000, e = 1)
+# Summarize the results a bit 
+summary_cp_b25_001 <- simple_cp_b25_001 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "simple", 
+         beta = "2.5")
+
+# Simulate beta 3.5 simple
+simple_cp_b35_001 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_35_001, 
+                        rewire = F, 
+                        r_max = 5000, e = 1)
+# Summarize the results a bit 
+summary_cp_b35_001 <- simple_cp_b35_001 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "simple", 
+         beta = "3.5")
+#### Radius 0.001 ####
+# Simulate beta 2.5 simple
+simple_cp_b25_0001 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_25_0001, 
+                        rewire = F, 
+                        r_max = 5000, e = 1)
+# Summarize the results a bit 
+summary_cp_b25_0001 <- simple_cp_b25_0001 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "simple", 
+         beta = "2.5")
+
+# Simulate beta 3.5 simple
+simple_cp_b35_0001 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_35_0001, 
+                        rewire = F, 
+                        r_max = 5000, e = 1)
+# Summarize the results a bit 
+summary_cp_b35_0001 <- simple_cp_b35_0001 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+         upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "simple", 
+         beta = "3.5")
+#### Ramos ####
+# Simulate beta 2.5 simple
+simple_rm_b25 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = rm_25, 
+                        rewire = F, 
+                        r_max = 5000, e = 1)
+# Summarize the results a bit 
+summary_rm_b25 <- simple_rm_b25 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "simple", 
+         beta = "2.5")
+
+# Simulate beta 3.5 simple
+simple_rm_b35 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = rm_35, 
+                        rewire = F, 
+                        r_max = 5000, e = 1)
+# Summarize the results a bit 
+summary_rm_b35 <- simple_rm_b35 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "simple", 
+         beta = "3.5")
+
+```
+
+### Complex 
+
+Let's run the simulations which take a long time. 
+
+```{r}
+set.seed(3)
+#### Radius 1 ####
+# Simulate beta 2.5 
+comp_cp_b25_1 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_25_1, 
+                        rewire = F, 
+                        r_max = 5000, e = 2)
+# Summarize the results a bit 
+summary_comp_cp_b25_1 <- comp_cp_b25_1 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "complex", 
+         beta = "2.5")
+
+# Simulate beta 3.5 
+comp_cp_b35_1 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_35_1, 
+                        rewire = F, 
+                        r_max = 5000, e = 2)
+# Summarize the results a bit 
+summary_comp_cp_b35_1 <- comp_cp_b35_1 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "complex", 
+         beta = "3.5")
+
+
+#### Radius 0.1 ####
+# Simulate beta 2.5 
+comp_cp_b25_01 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_25_01, 
+                        rewire = F, 
+                        r_max = 5000, e = 2)
+# Summarize the results a bit 
+summary_comp_cp_b25_01 <- comp_cp_b25_01 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "complex", 
+         beta = "2.5")
+
+# Simulate beta 3.5 
+comp_cp_b35_01 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_35_01, 
+                        rewire = F, 
+                        r_max = 5000, e = 2)
+# Summarize the results a bit 
+summary_comp_cp_b35_01 <- comp_cp_b35_01 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "complex", 
+         beta = "3.5")
+
+#### Radius 0.01 #### 
+# Simulate beta 2.5 
+comp_cp_b25_001 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_25_001, 
+                        rewire = F, 
+                        r_max = 5000, e = 2)
+# Summarize the results a bit 
+summary_comp_cp_b25_001 <- comp_cp_b25_001 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "complex", 
+         beta = "2.5")
+
+# Simulate beta 3.5 
+comp_cp_b35_001 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_35_001, 
+                        rewire = F, 
+                        r_max = 5000, e = 2)
+# Summarize the results a bit 
+summary_comp_cp_b35_001 <- comp_cp_b35_001 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "complex", 
+         beta = "3.5")
+#### Radius 0.001 ####
+# Simulate beta 2.5 
+comp_cp_b25_0001 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_25_0001, 
+                        rewire = F, 
+                        r_max = 5000, e = 2)
+# Summarize the results a bit 
+summary_comp_cp_b25_0001 <- comp_cp_b25_0001 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "complex", 
+         beta = "2.5")
+
+# Simulate beta 3.5 simple
+comp_cp_b35_0001 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = cp_35_0001, 
+                        rewire = F, 
+                        r_max = 5000, e = 2)
+# Summarize the results a bit 
+summary_comp_cp_b35_0001 <- comp_cp_b35_0001 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "complex", 
+         beta = "3.5")
+#### Ramos ####
+# Simulate beta 2.5 simple
+comp_rm_b25 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = rm_25, 
+                        rewire = F, 
+                        r_max = 5000, e = 2)
+# Summarize the results a bit 
+summary_comp_rm_b25 <- comp_rm_b25 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "complex", 
+         beta = "2.5")
+
+# Simulate beta 3.5 simple
+comp_rm_b35 <- map_df(c(1:50),  
+                        info_contagion, 
+                        net = rm_35, 
+                        rewire = F, 
+                        r_max = 5000, e = 2)
+# Summarize the results a bit 
+summary_comp_rm_b35 <- comp_rm_b35 %>% 
+  group_by(time) %>% 
+  summarise(avg = median(proportion), 
+            upper = quantile(proportion, 0.75), 
+            lower = quantile(proportion, 0.25)) %>% 
+  mutate(type = "complex", 
+         beta = "3.5")
+
+```
+
+Turn to reach 75% 
+
+```{r}
+simple_cp_b25_01 %>% 
+  group_by(sim, time) %>% 
+  summarise(above = proportion >=  0.75) %>% 
+  filter(above == T) %>% 
+  slice(1) %>% 
+  ungroup(.) %>% 
+  summarise(med =median(time), 
+            sd = sd(time))
+
+simple_cp_b25_1 %>% 
+  group_by(sim, time) %>% 
+  summarise(above = proportion >=  0.75) %>% 
+  filter(above == T) %>% 
+  slice(1) %>% 
+  ungroup(.) %>% 
+  summarise(med =median(time), 
+            sd = sd(time))
+
+simple_cp_b35_01 %>% 
+  group_by(sim, time) %>% 
+  summarise(above = proportion >=  0.75) %>% 
+  filter(above == T) %>% 
+  slice(1) %>% 
+  ungroup(.) %>% 
+  summarise(med =median(time), 
+            sd = sd(time))
+
+simple_cp_b35_1 %>% 
+  group_by(sim, time) %>% 
+  summarise(above = proportion >=  0.75) %>% 
+  filter(above == T) %>% 
+  slice(1) %>% 
+  ungroup(.) %>% 
+  summarise(med =median(time), 
+            sd = sd(time))
+
+comp_cp_b25_01 %>% 
+  group_by(sim, time) %>% 
+  summarise(above = proportion >=  0.75) %>% 
+  filter(above == T) %>% 
+  slice(1) %>% 
+  ungroup(.) %>% 
+  summarise(med =median(time), 
+            sd = sd(time))
+
+comp_cp_b25_1 %>% 
+  group_by(sim, time) %>% 
+  summarise(above = proportion >=  0.75) %>% 
+  filter(above == T) %>% 
+  slice(1) %>% 
+  ungroup(.) %>% 
+  summarise(med =median(time), 
+            sd = sd(time))
+
+comp_cp_b35_01 %>% 
+  group_by(sim, time) %>% 
+  summarise(above = proportion >=  0.75) %>% 
+  filter(above == T) %>% 
+  slice(1) %>% 
+  ungroup(.) %>% 
+  summarise(med =median(time), 
+            sd = sd(time))
+
+comp_cp_b35_1 %>% 
+  group_by(sim, time) %>% 
+  summarise(above = proportion >=  0.75) %>% 
+  filter(above == T) %>% 
+  slice(1) %>% 
+  ungroup(.) %>% 
+  summarise(med =median(time), 
+            sd = sd(time))
+
+```
+
+### Making the contagion dataframes 
+
+Let's build the simple contagion dataframe. 
+
+```{r}
+r1_df$radius <- 1
+r01_df$radius <- 0.1
+r001_df$radius <- 0.01
+r0001_df$radius <- 0.001
+rm_df$radius <- NA
+
+simple_df <- rbind(r1_df,
+                   r01_df,
+                   r001_df,
+                   r0001_df,
+                   rm_df)
+
+write_csv(simple_df, 
+          "simple_contagion.csv")
+```
+
+Now, the complex contagion dataframe
+
+```{r}
+r1_comp_df$radius <- 1
+r01_comp_df$radius <- 0.1
+r001_comp_df$radius <- 0.01
+r0001_comp_df$radius <- 0.001
+rm_comp_df$radius <- NA
+
+complex_df <- rbind(r1_comp_df,
+                   r01_comp_df,
+                   r001_comp_df,
+                   r0001_comp_df,
+                   rm_comp_df)
+
+write_csv(complex_df, 
+          "complex_contagion.csv")
+
+```
+
+### Contagion plot 
+
+```{r}
+complete <- rbind(simple_df, 
+                  complex_df) %>% 
+  mutate(beta = as.factor(beta), 
+         time_log = log(time), 
+         radius_rl = recode(radius, 
+                            `1` = "1", 
+                            `0.1` = "0.1", 
+                            `0.01` = "0.01", 
+                            `0.001` = "0.001"))
+
+complete$radius_rl[which(is.na(complete$radius_rl))] <- "Point-to-point"
+
+complete %>% 
+  filter(radius_rl != "0.001") %>% 
+  ggplot(aes(x = time, y = avg, fill = type )) + 
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill= type), alpha = 0.2) + 
+  geom_line(size = 1, aes(color = type)) + 
+  scale_fill_manual(values = c("#E69F00", "#56B4E9")) +
+  scale_color_manual(values = c("#E69F00", "#56B4E9")) +
+  scale_x_log10(
+    breaks = scales::trans_breaks("log10", function(x) 10^x),
+    labels = scales::trans_format("log10", scales::math_format(10^.x))
+  ) +
+  facet_grid(beta ~ radius_rl) + 
+  labs(x = "Time (logged)", 
+       y = "Proportion", 
+       title = "Contagion Trajectories") + 
+  ylim(c(0,1)) +
+  theme_minimal() + 
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + 
+theme(plot.title = element_text(hjust = 0.5))
+
+```
+
